@@ -1,0 +1,21 @@
+[Unit]
+Description=Virtual camera for the UniFi Protect Webcam plugin
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Loads the module if nothing has yet. Loaded bare it makes a "Dummy video
+# device" of its own, which some apps then offer as a camera, so without any
+# configuration it is told to make none; the one this unit needs is added
+# below. A machine that does configure v4l2loopback keeps its own options, and
+# a module that is already loaded is left exactly as it is.
+ExecStartPre=/bin/sh -c 'if /usr/bin/modprobe -c | /usr/bin/grep -q "^options v4l2loopback "; then exec /usr/bin/modprobe v4l2loopback; else exec /usr/bin/modprobe v4l2loopback devices=0; fi'
+# A device of its own, added next to any others rather than reconfiguring the
+# module. exclusive-caps is what makes Chrome list it: a node that announces
+# both capture and output is not offered as a camera at all.
+ExecStart=/usr/bin/v4l2loopback-ctl add --name "UniFi Protect" --exclusive-caps 1 /dev/video42
+ExecStop=/usr/bin/v4l2loopback-ctl delete /dev/video42
+
+[Install]
+WantedBy=multi-user.target

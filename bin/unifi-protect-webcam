@@ -1,0 +1,1145 @@
+#!/usr/bin/python3 -I
+"""unifi-protect-webcam: a UniFi Protect camera as a webcam.
+
+The bar widget calls this; so can you.
+
+    unifi-protect-webcam status                  one line of JSON: key, pin, device, feed
+    unifi-protect-webcam watch                   the same, again whenever it changes
+    unifi-protect-webcam cameras --host H        the cameras Protect knows about
+    unifi-protect-webcam on --host H [--size 1080p|720p] <camera-id>
+    unifi-protect-webcam off
+    unifi-protect-webcam set-key                 reads the API key from stdin
+    unifi-protect-webcam trust show --host H     the console's certificate, nothing written
+    unifi-protect-webcam trust accept --host H <fingerprint>
+
+How a camera becomes a webcam: Protect hands out an RTSPS address for the
+camera, ffmpeg decodes it into raw frames on a pipe, and this script writes
+those frames into a v4l2loopback device that Meet, Zoom and the rest see as an
+ordinary camera.
+
+The device is held by this script rather than by ffmpeg, which is the point of
+the arrangement. A v4l2loopback device made with exclusive_caps only counts as
+a camera while something has it open for writing, and a browser that looks in
+a gap where nothing does reports that there is no camera at all. ffmpeg comes
+and goes: when you switch cameras, when the console reboots, when the network
+hiccups. This script stays, and in every one of those gaps it keeps writing the
+last picture it had, so the call shows a frozen frame for a moment instead of
+losing its camera.
+
+Everything here is the standard library, run under the system python with -I,
+so nothing in the environment or the working directory decides what runs.
+"""
+
+import ctypes
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+import pwd
+import random
+import re
+import secrets
+import select
+import signal
+import ssl
+import stat
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+
+APP = "unifi-protect-webcam"
+
+# Made by the systemd unit in system/, as root, once. The number is fixed so the
+# unit can delete exactly the device it made, and high so it stays clear of
+# the low numbers real cameras and most other loopback setups take.
+DEVICE = "/dev/video42"
+DEVICE_LABEL = "UniFi Protect"
+
+SIZES = {"1080p": (1920, 1080), "720p": (1280, 720)}
+DEFAULT_SIZE = "1080p"
+
+API = "/proxy/protect/integration/v1"
+FFMPEG = "/usr/bin/ffmpeg"
+OPENSSL = "/usr/bin/openssl"
+
+# Bounds on everything that arrives from somewhere else.
+MAX_API_BYTES = 2 * 1024 * 1024
+MAX_CAMERAS = 64
+MAX_NAME = 64
+MAX_STATE_BYTES = 16 * 1024
+MAX_KEY_BYTES = 512
+MAX_PEM_BYTES = 16 * 1024
+MAX_LOG_BYTES = 256 * 1024
+NET_TIMEOUT = 8
+
+# No new frame from ffmpeg for this long means it is stuck somewhere its own
+# network timeout does not reach, and it is restarted.
+STALL = 15.0
+# How often the last picture is written again while nothing new arrives. Often
+# enough that a call sees a still picture rather than a dead camera.
+HOLD_EVERY = 0.25
+
+CAMERA_ID = re.compile(r"[A-Za-z0-9]{1,64}")
+HOSTNAME = re.compile(r"(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9-]{1,63})*")
+IPV6 = re.compile(r"\[[0-9A-Fa-f:.]{2,45}\]")
+KEY = re.compile(r"[A-Za-z0-9._~+/=-]{8,256}")
+FINGERPRINT = re.compile(r"(?:[0-9A-F]{2}:){31}[0-9A-F]{2}")
+STREAM = re.compile(r"rtsps://([^/\s?#]{1,260}):(\d{1,5})/([A-Za-z0-9]{1,64})(\?[A-Za-z0-9=&_-]{0,64})?")
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f​-‏‪-‮⁦-⁩]")
+
+
+class Failure(Exception):
+    """Something the panel can show, with a reason it can branch on."""
+
+    def __init__(self, message, reason=None):
+        super().__init__(message)
+        self.reason = reason
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def clean(value, limit=MAX_NAME):
+    """A string from the network, made safe to show and short enough to fit."""
+    return CONTROL.sub("", str(value)).strip()[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Files
+#
+# Every directory is walked from a trusted anchor one component at a time
+# through held descriptors, and every file is opened once, checked on that
+# descriptor, and read or replaced through it. Nothing here follows a symlink.
+# ---------------------------------------------------------------------------
+
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _own_dir(fd, what):
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise Failure(f"refusing {what}: not a directory of ours", "unsafe")
+
+
+def _walk(anchor_fd, parts):
+    """Open (making as needed) anchor/parts..., the last one private."""
+    fd = os.dup(anchor_fd)
+    try:
+        for name in parts:
+            try:
+                nxt = os.open(name, DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(name, 0o700, dir_fd=fd)
+                nxt = os.open(name, DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            _own_dir(fd, name)
+        # Our own directory, so repaired every time rather than only when the
+        # mode looks wrong, and anything in it that is not a plain file of
+        # ours is taken out rather than written through.
+        os.fchmod(fd, 0o700)
+        for entry in os.scandir(fd):
+            info = entry.stat(follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                os.unlink(entry.name, dir_fd=fd)
+            elif info.st_mode & 0o077:
+                child = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
+                try:
+                    os.fchmod(child, 0o600)
+                finally:
+                    os.close(child)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def home_dir():
+    return pwd.getpwuid(os.geteuid()).pw_dir
+
+
+def config_dir():
+    anchor = os.open(home_dir(), DIR_FLAGS)
+    try:
+        _own_dir(anchor, "the home directory")
+        return _walk(anchor, [".config", APP])
+    finally:
+        os.close(anchor)
+
+
+def runtime_dir():
+    base = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not base.startswith("/"):
+        raise Failure("XDG_RUNTIME_DIR is not set", "runtime")
+    anchor = os.open(base, DIR_FLAGS)
+    try:
+        _own_dir(anchor, "XDG_RUNTIME_DIR")
+        if os.fstat(anchor).st_mode & 0o077:
+            raise Failure("XDG_RUNTIME_DIR is open to others", "runtime")
+        return _walk(anchor, [APP])
+    finally:
+        os.close(anchor)
+
+
+def read_file(dirfd, name, limit):
+    """The bytes of dirfd/name, or None if there is no such file."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dirfd)
+    except FileNotFoundError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid()
+                or st.st_nlink != 1 or st.st_mode & 0o077):
+            raise Failure(f"refusing {name}: not a private file of ours", "unsafe")
+        os.set_blocking(fd, True)
+        data = b""
+        while len(data) <= limit:
+            chunk = os.read(fd, limit + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > limit:
+            raise Failure(f"refusing {name}: larger than it can be", "unsafe")
+        return data
+    finally:
+        os.close(fd)
+
+
+def write_file(dirfd, name, data):
+    """Replace dirfd/name with data, 0600 from the first byte, atomically."""
+    tmp = f".{name}.{secrets.token_hex(8)}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dirfd)
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+        os.rename(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        os.fsync(dirfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dirfd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+
+
+def remove_file(dirfd, name):
+    try:
+        os.unlink(name, dir_fd=dirfd)
+    except FileNotFoundError:
+        pass
+
+
+def read_json(dirfd, name, limit=MAX_STATE_BYTES):
+    raw = read_file(dirfd, name, limit)
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+# ---------------------------------------------------------------------------
+# The key and the console's certificate
+# ---------------------------------------------------------------------------
+
+
+def load_key():
+    """The API key, or "" if none is filed. Never printed, never in argv."""
+    with_dir = config_dir()
+    try:
+        raw = read_file(with_dir, "api-key", MAX_KEY_BYTES)
+    finally:
+        os.close(with_dir)
+    if raw is None:
+        return ""
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if line:
+            return line if KEY.fullmatch(line) else ""
+    return ""
+
+
+def load_pin():
+    """(PEM bytes, colon fingerprint) of the pinned certificate, or (None, None)."""
+    cdir = config_dir()
+    try:
+        pem = read_file(cdir, "gateway.pem", MAX_PEM_BYTES)
+    finally:
+        os.close(cdir)
+    if not pem:
+        return None, None
+    try:
+        der = ssl.PEM_cert_to_DER_cert(pem.decode("ascii"))
+    except (UnicodeDecodeError, ValueError):
+        return None, None
+    return pem, colon(hashlib.sha256(der).hexdigest())
+
+
+def colon(hexdigest):
+    text = hexdigest.upper()
+    return ":".join(text[i:i + 2] for i in range(0, len(text), 2))
+
+
+def parse_host(value):
+    """(host, port) for a console address, or a Failure. No paths, no users."""
+    value = str(value or "").strip()
+    host, port = value, 443
+    if value.startswith("["):
+        end = value.find("]")
+        host, rest = value[:end + 1], value[end + 1:]
+        if not IPV6.fullmatch(host):
+            raise Failure("not a console address", "host")
+        if rest:
+            if not rest.startswith(":") or not rest[1:].isdigit():
+                raise Failure("not a console address", "host")
+            port = int(rest[1:])
+    else:
+        if value.count(":") == 1:
+            host, _, number = value.partition(":")
+            if not number.isdigit():
+                raise Failure("not a console address", "host")
+            port = int(number)
+        if not HOSTNAME.fullmatch(host):
+            raise Failure("not a console address", "host")
+    if not 0 < port < 65536:
+        raise Failure("not a console address", "host")
+    return host, port
+
+
+def _tls_context():
+    # The console signs its own certificate for a name that is not the address
+    # you reach it on, so neither the chain nor the hostname can ever check
+    # out. Both are replaced by something stricter: the certificate the far
+    # end presents has to be byte for byte the one you pinned, and that is
+    # compared after the handshake and before anything secret is written.
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+def _connect(host, port):
+    conn = http.client.HTTPSConnection(host.strip("[]"), port, timeout=NET_TIMEOUT, context=_tls_context())
+    try:
+        conn.connect()
+    except (OSError, ssl.SSLError) as exc:
+        conn.close()
+        raise Failure(f"cannot reach {host}: {clean(exc, 120)}", "unreachable")
+    return conn
+
+
+def peer_der(host, port):
+    conn = _connect(host, port)
+    try:
+        der = conn.sock.getpeercert(binary_form=True)
+    finally:
+        conn.close()
+    if not der:
+        raise Failure("the console presented no certificate", "unreachable")
+    return der
+
+
+def api(host, port, path, limit=MAX_API_BYTES):
+    """GET path from the integration API, as JSON, over the pinned connection."""
+    key = load_key()
+    if not key:
+        raise Failure("no API key yet", "nokey")
+    _, pinned = load_pin()
+    if not pinned:
+        raise Failure("the console's certificate is not pinned yet", "untrusted")
+    conn = _connect(host, port)
+    try:
+        presented = colon(hashlib.sha256(conn.sock.getpeercert(binary_form=True) or b"").hexdigest())
+        if presented != pinned:
+            raise Failure("the console's certificate changed since you pinned it", "pinchanged")
+        # Only now, on a connection to the certificate you agreed to.
+        conn.request("GET", API + path, headers={"X-API-KEY": key, "Accept": "application/json"})
+        resp = conn.getresponse()
+        body = resp.read(limit + 1)
+    except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+        raise Failure(f"the console stopped answering: {clean(exc, 120)}", "unreachable")
+    finally:
+        conn.close()
+    if len(body) > limit:
+        raise Failure("the console sent more than expected", "badresponse")
+    if resp.status in (401, 403):
+        raise Failure("the console refused the API key", "badkey")
+    if resp.status == 404:
+        raise Failure("the console has no such camera", "notfound")
+    if resp.status != 200:
+        raise Failure(f"the console answered {resp.status}", "badresponse")
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise Failure("the console sent something that is not JSON", "badresponse")
+
+
+def cert_names(pem):
+    """DNS names in a certificate, for ffmpeg's hostname check. PEM on stdin."""
+    try:
+        done = subprocess.run([OPENSSL, "x509", "-noout", "-subject", "-nameopt", "RFC2253",
+                               "-ext", "subjectAltName"],
+                              input=pem, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=5, env={"PATH": "/usr/bin"})
+    except (OSError, subprocess.SubprocessError):
+        return []
+    text = done.stdout[:8192].decode("utf-8", "replace")
+    names = re.findall(r"DNS:([A-Za-z0-9.-]{1,253})", text)
+    match = re.search(r"subject=(?:[^\n]*,)?CN=([A-Za-z0-9.-]{1,253})", text)
+    if match:
+        names.append(match.group(1))
+    return [n for n in names if HOSTNAME.fullmatch(n)]
+
+
+def cert_facts(der):
+    pem = ssl.DER_cert_to_PEM_cert(der).encode("ascii")
+    try:
+        done = subprocess.run([OPENSSL, "x509", "-noout", "-subject", "-enddate", "-nameopt", "RFC2253"],
+                              input=pem, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=5, env={"PATH": "/usr/bin"})
+        text = done.stdout[:4096].decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        text = ""
+    subject = re.search(r"^subject=(.*)$", text, re.M)
+    until = re.search(r"^notAfter=(.*)$", text, re.M)
+    return {
+        "subject": clean(subject.group(1), 200) if subject else "",
+        "expires": clean(until.group(1), 64) if until else "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# The device
+# ---------------------------------------------------------------------------
+
+
+def device_state():
+    name = os.path.basename(DEVICE)
+    label = ""
+    try:
+        fd = os.open(f"/sys/class/video4linux/{name}/name", os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            label = os.read(fd, 256).decode("utf-8", "replace").strip()
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    try:
+        is_char = stat.S_ISCHR(os.stat(DEVICE).st_mode)
+    except OSError:
+        is_char = False
+    exists = is_char and bool(label)
+    ours = exists and label == DEVICE_LABEL
+    return {
+        "path": DEVICE,
+        "label": DEVICE_LABEL,
+        "exists": exists,
+        # Somebody else's device on our number is not ours to write into.
+        "taken": exists and not ours,
+        "ready": ours and os.access(DEVICE, os.W_OK),
+        "writable": ours and os.access(DEVICE, os.W_OK),
+    }
+
+
+V4L2_BUF_TYPE_VIDEO_OUTPUT = 2
+V4L2_FIELD_NONE = 1
+V4L2_COLORSPACE_REC709 = 3
+VIDIOC_S_FMT = 0xC0D05605  # _IOWR('V', 5, struct v4l2_format), 208 bytes
+
+
+def fourcc(code):
+    return sum(ord(char) << (8 * index) for index, char in enumerate(code))
+
+
+class V4l2PixFormat(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        "width", "height", "pixelformat", "field", "bytesperline", "sizeimage",
+        "colorspace", "priv", "flags", "ycbcr_enc", "quantization", "xfer_func")]
+
+
+class V4l2Format(ctypes.Structure):
+    # The kernel's union holds a v4l2_window, which has pointers in it, so it
+    # is 8-byte aligned and starts after four bytes of padding: 208 in all.
+    _fields_ = [
+        ("type", ctypes.c_uint32),
+        ("_pad", ctypes.c_uint32),
+        ("pix", V4l2PixFormat),
+        ("_rest", ctypes.c_uint8 * (200 - ctypes.sizeof(V4l2PixFormat))),
+    ]
+
+
+class Loopback:
+    """Writes NV12 frames into the v4l2loopback device."""
+
+    def __init__(self, width, height):
+        self.width, self.height = width, height
+        self.frame_size = width * height * 3 // 2
+        self.fd = os.open(DEVICE, os.O_WRONLY | os.O_CLOEXEC)
+        try:
+            if not stat.S_ISCHR(os.fstat(self.fd).st_mode):
+                raise OSError("not a video device")
+            fmt = V4l2Format()
+            fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT
+            fmt.pix.width, fmt.pix.height = width, height
+            fmt.pix.pixelformat = fourcc("NV12")
+            fmt.pix.field = V4L2_FIELD_NONE
+            fmt.pix.bytesperline = width
+            fmt.pix.sizeimage = self.frame_size
+            fmt.pix.colorspace = V4L2_COLORSPACE_REC709
+            fcntl.ioctl(self.fd, VIDIOC_S_FMT, fmt)
+        except BaseException:
+            os.close(self.fd)
+            raise
+
+    def black(self):
+        # Video black in NV12: luma at 16, both chroma planes at the midpoint.
+        luma = self.width * self.height
+        return bytearray(b"\x10" * luma + b"\x80" * (luma // 2))
+
+    def write(self, frame):
+        view = memoryview(frame)
+        while view:
+            view = view[os.write(self.fd, view):]
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# The feed: one detached process per session of being switched on
+# ---------------------------------------------------------------------------
+
+
+def start_time(pid):
+    """The kernel's start time of pid, which a reused pid does not share."""
+    with open(f"/proc/{int(pid)}/stat", "rb") as handle:
+        fields = handle.read(4096).rsplit(b")", 1)[1].split()
+    return int(fields[19])
+
+
+def lock_held(rdir):
+    try:
+        fd = os.open("feed.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=rdir)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def feed_identity(rdir):
+    """(pid, start) of the running feed, checked against the kernel, or None."""
+    if not lock_held(rdir):
+        return None
+    state = read_json(rdir, "feed.json") or {}
+    pid, start = state.get("pid"), state.get("start")
+    if not isinstance(pid, int) or not isinstance(start, int) or pid <= 1:
+        return None
+    try:
+        if start_time(pid) != start or os.stat(f"/proc/{pid}").st_uid != os.geteuid():
+            return None
+    except (OSError, ValueError, IndexError):
+        return None
+    return pid, start
+
+
+def signal_feed(rdir, signum):
+    ident = feed_identity(rdir)
+    if ident is None:
+        return False
+    pid, start = ident
+    try:
+        pidfd = os.pidfd_open(pid)
+    except OSError:
+        return False
+    try:
+        # Re-read through the pidfd's process: if the pid was reused between
+        # the check above and the open, the start time no longer matches.
+        if start_time(pid) != start:
+            return False
+        signal.pidfd_send_signal(pidfd, signum)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(pidfd)
+
+
+def feed_state(rdir):
+    alive = lock_held(rdir)
+    stored = read_json(rdir, "feed.json") or {}
+    state = {"on": alive, "streaming": False, "camera_id": "", "camera": "", "size": "",
+             "fps": 0.0, "error": ""}
+    if isinstance(stored.get("camera_id"), str) and CAMERA_ID.fullmatch(stored["camera_id"]):
+        state["camera_id"] = stored["camera_id"]
+    if isinstance(stored.get("camera"), str):
+        state["camera"] = clean(stored["camera"])
+    if stored.get("size") in SIZES:
+        state["size"] = stored["size"]
+    if isinstance(stored.get("error"), str):
+        state["error"] = clean(stored["error"], 240)
+    if alive:
+        state["streaming"] = stored.get("streaming") is True
+        fps = stored.get("fps")
+        if isinstance(fps, (int, float)) and 0 <= fps < 1000:
+            state["fps"] = round(float(fps), 1)
+    return state
+
+
+def _die_with_parent():
+    """In ffmpeg, before it starts: go when the feed goes, however it goes."""
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+    except (OSError, AttributeError):
+        pass
+
+
+class Feed:
+    def __init__(self, rdir):
+        self.rdir = rdir
+        self.stopping = False
+        self.reload = False
+        self.process = None
+        self.loopback = None
+        self.failures = 0
+        self.retry_at = 0.0
+        self.stderr = deque(maxlen=4)
+        self.alias = ""
+        self.log_bytes = 0
+        # Old ffmpegs on their way out, with the moment they get a SIGKILL. Left
+        # to go on their own so the loop never waits for an RTSP teardown.
+        self.retired = []
+        # Frames reach the device from two threads: the loop when ffmpeg has a
+        # new one, the holder when it has not. One lock, so a frame always goes
+        # in whole and the swap of the two buffers is never seen half done.
+        self.write_lock = threading.Lock()
+        self.last_write = 0.0
+        self.state = {"pid": os.getpid(), "start": start_time(os.getpid()), "camera_id": "",
+                      "camera": "", "size": "", "streaming": False, "fps": 0.0, "error": ""}
+        # Before the pid is published, not after: `on` sends a SIGHUP the moment
+        # it can see a running feed, and the default for SIGHUP is to die.
+        signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stopping", True))
+        signal.signal(signal.SIGINT, lambda *_: setattr(self, "stopping", True))
+        signal.signal(signal.SIGHUP, lambda *_: setattr(self, "reload", True))
+
+    # -- bookkeeping -------------------------------------------------------
+
+    def log(self, message):
+        line = time.strftime("%H:%M:%S ") + clean(message, 300) + "\n"
+        if self.log_bytes + len(line) > MAX_LOG_BYTES:
+            return
+        self.log_bytes += len(line)
+        try:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+        except OSError:
+            pass
+
+    def publish(self):
+        try:
+            write_file(self.rdir, "feed.json", json.dumps(self.state).encode())
+        except OSError:
+            pass
+
+    def fail(self, message):
+        self.failures += 1
+        delay = min(30.0, 2.0 * self.failures) * random.uniform(0.8, 1.2)
+        self.retry_at = time.monotonic() + delay
+        self.state.update(streaming=False, fps=0.0, error=message)
+        self.publish()
+        self.log(f"{message}; trying again in {delay:.0f}s")
+
+    def wanted(self):
+        wanted = read_json(self.rdir, "wanted.json") or {}
+        camera = wanted.get("camera")
+        size = wanted.get("size")
+        host = wanted.get("host")
+        if not isinstance(camera, str) or not CAMERA_ID.fullmatch(camera):
+            raise Failure("no camera chosen", "nocamera")
+        if size not in SIZES:
+            size = DEFAULT_SIZE
+        return parse_host(host), camera, size
+
+    # -- ffmpeg ------------------------------------------------------------
+
+    def stream_for(self, host, port, camera):
+        info = api(host, port, f"/cameras/{camera}")
+        if not isinstance(info, dict):
+            raise Failure("the console sent an unexpected answer", "badresponse")
+        name = clean(info.get("name") or camera)
+        streams = api(host, port, f"/cameras/{camera}/rtsps-stream")
+        if not isinstance(streams, dict):
+            raise Failure("the console sent an unexpected answer", "badresponse")
+        for quality in ("high", "medium", "low"):
+            url = streams.get(quality)
+            if isinstance(url, str):
+                match = STREAM.fullmatch(url)
+                if match:
+                    # Reached on the address you gave, not whichever one the
+                    # console put in the link: that is the one you pinned.
+                    _, rtsp_port, alias, query = match.groups()
+                    return name, alias, f"rtsps://{host}:{int(rtsp_port)}/{alias}{query or ''}"
+        raise Failure(f"{name} has no RTSP stream: switch one on in Protect, under the camera's Advanced settings", "nostream")
+
+    def start_ffmpeg(self):
+        (host, port), camera, size = self.wanted()
+        name, alias, url = self.stream_for(host, port, camera)
+        pem, _ = load_pin()
+        verify = cert_names(pem or b"")
+        if not pem or not verify:
+            raise Failure("cannot read a name out of the pinned certificate", "untrusted")
+
+        # The pinned certificate goes to ffmpeg as the only one it trusts, on a
+        # descriptor rather than by name, so what it trusts is what was read.
+        ca_read, ca_write = os.pipe()
+        try:
+            os.write(ca_write, pem)
+        finally:
+            os.close(ca_write)
+        width, height = SIZES[size]
+        argv = [
+            FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-nostats",
+            "-rtsp_transport", "tcp",
+            # Give up on a silent socket rather than hold a frozen picture forever.
+            "-timeout", "10000000",
+            # Verified against the pinned certificate and the name inside it.
+            "-tls_verify", "1", "-ca_file", f"/dev/fd/{ca_read}", "-verifyhost", verify[0],
+            # The newest frame rather than a smooth one from a second ago.
+            "-fflags", "nobuffer", "-flags", "low_delay",
+            "-i", url,
+            "-map", "0:v:0", "-an", "-sn", "-dn",
+            # Filled and cropped rather than letterboxed, so a camera that is not
+            # 16:9 still fills the frame a call expects.
+            "-vf", f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},format=nv12",
+            "-fps_mode", "passthrough",
+            "-f", "rawvideo", "-pix_fmt", "nv12", "pipe:1",
+        ]
+        try:
+            self.process = subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                pass_fds=(ca_read,), env={"PATH": "/usr/bin", "HOME": home_dir(), "LANG": "C.UTF-8"},
+                preexec_fn=_die_with_parent)
+        except OSError as exc:
+            raise Failure(f"cannot start ffmpeg: {clean(exc, 120)}", "ffmpeg")
+        finally:
+            os.close(ca_read)
+        try:
+            fcntl.fcntl(self.process.stdout.fileno(), 1031, 1 << 20)  # F_SETPIPE_SZ
+        except OSError:
+            pass
+        self.alias = alias
+        self.stderr.clear()
+        threading.Thread(target=self._drain, args=(self.process,), daemon=True).start()
+        self.state.update(camera_id=camera, camera=name, size=size, error="")
+        self.publish()
+        self.log(f"reading {name} at {size}")
+
+    def _drain(self, process):
+        # ffmpeg's own errors name the stream address, which is a key to the
+        # camera, so it is cut out before anything is kept.
+        while True:
+            raw = process.stderr.readline(600)  # bounded even without a newline
+            if not raw:
+                return
+            line = raw.decode("utf-8", "replace")
+            if self.alias:
+                line = line.replace(self.alias, "…")
+            self.stderr.append(clean(line, 200))
+
+    def stop_ffmpeg(self):
+        """Ask the current ffmpeg to go, without waiting for it to."""
+        process, self.process = self.process, None
+        if process is None:
+            return
+        if process.poll() is None:
+            process.terminate()
+        self.retired.append((process, time.monotonic() + 3.0))
+
+    def reap(self, force=False):
+        still = []
+        for process, deadline in self.retired:
+            if process.poll() is None and (force or time.monotonic() >= deadline):
+                process.kill()
+                if force:
+                    process.wait()
+            if process.poll() is None:
+                still.append((process, deadline))
+            else:
+                process.stdout.close()
+        self.retired = still
+
+    def hold(self):
+        """Write the last picture again whenever nothing new has come in.
+
+        A thread of its own, so nothing the loop waits on (the console, an
+        ffmpeg that is slow to start) can leave the device without frames.
+        """
+        while not self.stopping:
+            time.sleep(0.05)
+            with self.write_lock:
+                if self.loopback is not None and time.monotonic() - self.last_write >= HOLD_EVERY:
+                    try:
+                        self.loopback.write(self.last)
+                    except OSError:
+                        pass
+                    self.last_write = time.monotonic()
+
+    # -- the loop ----------------------------------------------------------
+
+    def serve(self):
+        fatal = None
+        try:
+            try:
+                _, _, size = self.wanted()
+                self.open_device(size)
+            except (Failure, OSError) as exc:
+                fatal = str(exc)
+                return
+            threading.Thread(target=self.hold, daemon=True).start()
+            self.run()
+        finally:
+            self.stopping = True
+            self.stop_ffmpeg()
+            self.reap(force=True)
+            with self.write_lock:
+                if self.loopback is not None:
+                    self.loopback.close()
+                    self.loopback = None
+            if fatal:
+                # Left behind on purpose, so the panel can say why it did not start.
+                self.state.update(streaming=False, fps=0.0, error=fatal)
+                self.publish()
+                self.log(fatal)
+            else:
+                remove_file(self.rdir, "feed.json")
+
+    def open_device(self, size):
+        with self.write_lock:
+            if self.loopback is not None:
+                self.loopback.close()
+                self.loopback = None
+            device = device_state()
+            if not device["ready"]:
+                raise Failure(f"{DEVICE} is not set up yet", "nodevice")
+            width, height = SIZES[size]
+            try:
+                loopback = Loopback(width, height)
+            except OSError as exc:
+                raise Failure(f"cannot open {DEVICE}: {clean(exc, 120)}", "nodevice")
+            self.frame = bytearray(loopback.frame_size)
+            self.last = loopback.black()
+            self.size = size
+            # Written straight away, so the camera shows up in a call's list
+            # now rather than once the first real frame has made its way here.
+            loopback.write(self.last)
+            self.last_write = time.monotonic()
+            self.loopback = loopback
+
+    def run(self):
+        filled = 0
+        last_frame = 0.0
+        started = 0.0
+        frames, window = 0, time.monotonic()
+        published = 0.0
+        while not self.stopping:
+            now = time.monotonic()
+
+            if self.reload:
+                self.reload = False
+                self.stop_ffmpeg()
+                filled = 0
+                self.failures, self.retry_at = 0, 0.0
+                try:
+                    _, _, size = self.wanted()
+                    if size != self.size:
+                        self.open_device(size)
+                except (Failure, OSError) as exc:
+                    self.fail(str(exc))
+
+            if self.process is None and now >= self.retry_at:
+                try:
+                    self.start_ffmpeg()
+                    filled, started, last_frame = 0, now, 0.0
+                except Failure as exc:
+                    self.fail(str(exc))
+
+            process = self.process
+            if process is not None:
+                ready, _, _ = select.select([process.stdout], [], [], 0.05)
+                if ready:
+                    view = memoryview(self.frame)
+                    got = process.stdout.raw.readinto(view[filled:])
+                    if got:
+                        filled += got
+                        if filled == len(self.frame):
+                            with self.write_lock:
+                                self.loopback.write(self.frame)
+                                self.frame, self.last = self.last, self.frame
+                                self.last_write = time.monotonic()
+                            filled = 0
+                            last_frame = time.monotonic()
+                            frames += 1
+                            if self.failures:
+                                self.failures = 0
+                    elif process.poll() is not None or got == 0:
+                        why = self.stderr[-1] if self.stderr else f"ffmpeg exited with {process.wait()}"
+                        self.stop_ffmpeg()
+                        self.fail(f"the stream stopped: {why}")
+                elif now - (last_frame or started) > STALL:
+                    self.stop_ffmpeg()
+                    self.fail(f"no picture for {int(STALL)} seconds")
+            else:
+                time.sleep(0.05)
+
+            self.reap()
+            now = time.monotonic()
+            if now - window >= 1.0:
+                fps = frames / (now - window)
+                frames, window = 0, now
+                streaming = last_frame > 0 and now - last_frame < 2.0
+                if streaming:
+                    self.state["error"] = ""
+                if (now - published >= 5.0 or streaming != self.state["streaming"]
+                        or abs(fps - self.state["fps"]) >= 0.5):
+                    self.state.update(streaming=streaming, fps=round(fps, 1))
+                    self.publish()
+                    published = now
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def status():
+    rdir = runtime_dir()
+    try:
+        feed = feed_state(rdir)
+    finally:
+        os.close(rdir)
+    _, pin = load_pin()
+    return {"ok": True, "key": bool(load_key()), "trusted": bool(pin),
+            "device": device_state(), "feed": feed}
+
+
+def cmd_watch():
+    previous = None
+    while True:
+        try:
+            current = json.dumps(status(), separators=(",", ":"))
+        except Failure as exc:
+            current = json.dumps({"ok": False, "error": str(exc), "reason": exc.reason})
+        if current != previous:
+            try:
+                sys.stdout.write(current + "\n")
+                sys.stdout.flush()
+            except BrokenPipeError:
+                return
+            previous = current
+        time.sleep(0.5)
+
+
+def cmd_cameras(host):
+    h, port = parse_host(host)
+    body = api(h, port, "/cameras")
+    if not isinstance(body, list):
+        raise Failure("the console sent an unexpected answer", "badresponse")
+    cameras = []
+    for item in body[:MAX_CAMERAS]:
+        if not isinstance(item, dict):
+            continue
+        cid = item.get("id")
+        if not isinstance(cid, str) or not CAMERA_ID.fullmatch(cid):
+            continue
+        cameras.append({"id": cid, "name": clean(item.get("name") or cid),
+                        "connected": item.get("state") == "CONNECTED"})
+    return {"ok": True, "cameras": cameras}
+
+
+def cmd_on(host, size, camera):
+    if not CAMERA_ID.fullmatch(camera or ""):
+        raise Failure("not a camera id", "nocamera")
+    if size not in SIZES:
+        raise Failure("size is 1080p or 720p", "size")
+    parse_host(host)
+    if not device_state()["ready"]:
+        raise Failure(f"{DEVICE} is not set up yet", "nodevice")
+    if not load_key():
+        raise Failure("no API key yet", "nokey")
+    if not load_pin()[1]:
+        raise Failure("the console's certificate is not pinned yet", "untrusted")
+    rdir = runtime_dir()
+    try:
+        write_file(rdir, "wanted.json", json.dumps({"host": host, "camera": camera, "size": size}).encode())
+        if lock_held(rdir):
+            if signal_feed(rdir, signal.SIGHUP):
+                return {"ok": True, "switched": True}
+            raise Failure("the feed is running but cannot be reached", "feed")
+        remove_file(rdir, "feed.json")
+        log_fd = os.open("feed.log", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600, dir_fd=rdir)
+        try:
+            # Detached, in a session of its own: the camera has to outlive the
+            # panel that switched it on, and restarting the shell must not take
+            # a call's camera with it.
+            subprocess.Popen([sys.executable, "-I", "-S", os.path.realpath(__file__), "feed"],
+                             stdin=subprocess.DEVNULL, stdout=log_fd, stderr=log_fd,
+                             start_new_session=True,
+                             env={"PATH": "/usr/bin", "HOME": home_dir(), "LANG": "C.UTF-8",
+                                  "XDG_RUNTIME_DIR": os.environ["XDG_RUNTIME_DIR"]})
+        finally:
+            os.close(log_fd)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if feed_identity(rdir) is not None:
+                return {"ok": True}
+            stored = read_json(rdir, "feed.json") or {}
+            if not lock_held(rdir) and stored.get("error"):
+                raise Failure(clean(stored["error"], 240), "feed")
+            time.sleep(0.1)
+        raise Failure("the feed did not come up", "feed")
+    finally:
+        os.close(rdir)
+
+
+def cmd_off():
+    rdir = runtime_dir()
+    try:
+        if not lock_held(rdir):
+            remove_file(rdir, "feed.json")
+            return {"ok": True, "already": True}
+        for signum, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 2)):
+            if not signal_feed(rdir, signum):
+                break
+            deadline = time.monotonic() + wait
+            while time.monotonic() < deadline and lock_held(rdir):
+                time.sleep(0.1)
+            if not lock_held(rdir):
+                remove_file(rdir, "feed.json")
+                return {"ok": True}
+        raise Failure("could not stop the feed", "feed")
+    finally:
+        os.close(rdir)
+
+
+def cmd_feed():
+    rdir = runtime_dir()
+    lock = os.open("feed.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=rdir)
+    st = os.fstat(lock)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+        raise Failure("refusing the lock file", "unsafe")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return  # already running; that one is the feed
+    feed = Feed(rdir)
+    feed.publish()
+    feed.serve()
+
+
+def cmd_set_key():
+    raw = sys.stdin.buffer.read(MAX_KEY_BYTES + 1)
+    if len(raw) > MAX_KEY_BYTES:
+        raise Failure("that is not an API key", "badkey")
+    key = raw.decode("utf-8", "replace").strip()
+    if not KEY.fullmatch(key):
+        raise Failure("that is not an API key", "badkey")
+    cdir = config_dir()
+    try:
+        write_file(cdir, "api-key", (key + "\n").encode())
+    finally:
+        os.close(cdir)
+    return {"ok": True}
+
+
+def cmd_trust(action, host, fingerprint=None):
+    h, port = parse_host(host)
+    der = peer_der(h, port)
+    presented = colon(hashlib.sha256(der).hexdigest())
+    _, pinned = load_pin()
+    if action == "show":
+        return dict({"ok": True, "fingerprint": presented, "pinned": pinned or "",
+                     "matches": presented == pinned}, **cert_facts(der))
+    wanted = str(fingerprint or "").strip().upper()
+    if not FINGERPRINT.fullmatch(wanted):
+        raise Failure("not a fingerprint", "fingerprint")
+    if wanted != presented:
+        raise Failure("the console is presenting a different certificate now", "fingerprint")
+    pem = ssl.DER_cert_to_PEM_cert(der).encode("ascii")
+    if not cert_names(pem):
+        raise Failure("this certificate names no host, so the stream could not be checked against it", "fingerprint")
+    cdir = config_dir()
+    try:
+        write_file(cdir, "gateway.pem", pem)
+    finally:
+        os.close(cdir)
+    return {"ok": True, "fingerprint": presented}
+
+
+def option(args, name, default=None):
+    if name in args:
+        at = args.index(name)
+        if at + 1 >= len(args):
+            raise Failure(f"{name} needs a value", "usage")
+        value = args[at + 1]
+        del args[at:at + 2]
+        return value
+    return default
+
+
+def main(argv):
+    args = list(argv)
+    command = args.pop(0) if args else "status"
+    host = option(args, "--host", "")
+    size = option(args, "--size", DEFAULT_SIZE)
+    try:
+        if command == "status":
+            emit(status())
+        elif command == "watch":
+            cmd_watch()
+        elif command == "cameras":
+            emit(cmd_cameras(host))
+        elif command == "on":
+            emit(cmd_on(host, size, args[0] if args else ""))
+        elif command == "off":
+            emit(cmd_off())
+        elif command == "feed":
+            cmd_feed()
+        elif command == "set-key":
+            emit(cmd_set_key())
+        elif command == "trust" and args and args[0] in ("show", "accept"):
+            emit(cmd_trust(args[0], host, args[1] if len(args) > 1 else None))
+        else:
+            raise Failure(f"unknown command: {clean(command, 40)}", "usage")
+    except Failure as exc:
+        emit({"ok": False, "error": str(exc), "reason": exc.reason or "error"})
+        return 1
+    except OSError as exc:
+        emit({"ok": False, "error": clean(exc, 200), "reason": "error"})
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
