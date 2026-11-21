@@ -14,6 +14,8 @@ Switch another camera on and the same webcam shows that one instead, so a call t
 omarchy plugin add https://github.com/jankeesvw/omarchy-unifi-protect-webcam.git --enable
 ```
 
+It needs `ffmpeg`, `python3` and `openssl`, which every Omarchy install already has, and `v4l2loopback`, which the setup below installs. You also need a UniFi console whose Protect has the integration API, which is the one that hands out keys at `/unifi-api/protect`.
+
 Then three things, once. The panel walks you through all of them.
 
 ### 1. The virtual camera
