@@ -52,7 +52,7 @@ from collections import deque
 
 APP = "unifi-protect-webcam"
 
-# Made by the systemd unit in system/, as root, once. The number is fixed so the
+# Made by the systemd unit the README has you install, as root, once. The number is fixed so the
 # unit can delete exactly the device it made, and high so it stays clear of
 # the low numbers real cameras and most other loopback setups take.
 DEVICE = "/dev/video42"
@@ -388,16 +388,45 @@ def api(host, port, path, limit=MAX_API_BYTES):
         raise Failure("the console sent something that is not JSON", "badresponse")
 
 
-def cert_names(pem):
-    """DNS names in a certificate, for ffmpeg's hostname check. PEM on stdin."""
+def openssl(args, data, limit=8192, deadline=5.0):
+    """openssl's answer about a certificate handed over on stdin, or "".
+
+    Read in bounded chunks against a deadline rather than collected whole: one
+    byte past the limit and the answer is refused, not cut short.
+    """
     try:
-        done = subprocess.run([OPENSSL, "x509", "-noout", "-subject", "-nameopt", "RFC2253",
-                               "-ext", "subjectAltName"],
-                              input=pem, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              timeout=5, env={"PATH": "/usr/bin"})
-    except (OSError, subprocess.SubprocessError):
-        return []
-    text = done.stdout[:8192].decode("utf-8", "replace")
+        proc = subprocess.Popen([OPENSSL] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, env={"PATH": "/usr/bin"},
+                                start_new_session=True)
+    except OSError:
+        return ""
+    out = b""
+    try:
+        proc.stdin.write(data)
+        proc.stdin.close()
+        fd = proc.stdout.fileno()
+        until = time.monotonic() + deadline
+        while len(out) <= limit:
+            left = until - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                return ""
+            chunk = os.read(fd, limit + 1 - len(out))
+            if not chunk:
+                break
+            out += chunk
+    except OSError:
+        return ""
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        proc.stdout.close()
+    return "" if len(out) > limit else out.decode("utf-8", "replace")
+
+
+def cert_names(pem):
+    """DNS names in a certificate, for ffmpeg's hostname check."""
+    text = openssl(["x509", "-noout", "-subject", "-nameopt", "RFC2253", "-ext", "subjectAltName"], pem)
     names = re.findall(r"DNS:([A-Za-z0-9.-]{1,253})", text)
     match = re.search(r"subject=(?:[^\n]*,)?CN=([A-Za-z0-9.-]{1,253})", text)
     if match:
@@ -407,13 +436,7 @@ def cert_names(pem):
 
 def cert_facts(der):
     pem = ssl.DER_cert_to_PEM_cert(der).encode("ascii")
-    try:
-        done = subprocess.run([OPENSSL, "x509", "-noout", "-subject", "-enddate", "-nameopt", "RFC2253"],
-                              input=pem, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              timeout=5, env={"PATH": "/usr/bin"})
-        text = done.stdout[:4096].decode("utf-8", "replace")
-    except (OSError, subprocess.SubprocessError):
-        text = ""
+    text = openssl(["x509", "-noout", "-subject", "-enddate", "-nameopt", "RFC2253"], pem, limit=4096)
     subject = re.search(r"^subject=(.*)$", text, re.M)
     until = re.search(r"^notAfter=(.*)$", text, re.M)
     return {

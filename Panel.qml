@@ -32,7 +32,6 @@ Panel {
 
   readonly property string script:
     decodeURIComponent(Qt.resolvedUrl("bin/unifi-protect-webcam").toString().replace(/^file:\/\//, ""))
-  readonly property string pluginDir: script.replace(/\/bin\/unifi-protect-webcam$/, "")
 
   readonly property string host: String(setting("host", "192.168.1.1"))
   readonly property string size: setting("size", "1080p") === "720p" ? "720p" : "1080p"
@@ -148,18 +147,33 @@ Panel {
   readonly property bool statusBad: root.actionError !== "" || root.device.taken === true
     || (root.live && !root.streaming && !!root.feed.error) || (!root.live && !!root.feed.error)
 
-  // What the one-time setup asks for, verbatim. The panel never runs any of it:
-  // it needs root, and root runs only what you pasted into your own terminal.
-  readonly property string setupCommands: {
-    var dir = "'" + root.pluginDir.replace(/'/g, "'\\''") + "'"
-    return "sudo pacman -S --needed v4l2loopback-dkms v4l2loopback-utils\n"
-      + "cd " + dir + "\n"
-      + "sudo install -m 644 system/unifi-protect-webcam.service /etc/systemd/system/\n"
-      + "sudo install -m 644 system/70-unifi-protect-webcam.rules /etc/udev/rules.d/\n"
-      + "sudo udevadm control --reload-rules\n"
-      + "sudo systemctl daemon-reload\n"
-      + "sudo systemctl enable --now unifi-protect-webcam.service"
-  }
+  // What the one-time setup asks for, verbatim, and the same as the README. The
+  // panel never runs any of it: it needs root, and root runs only what you
+  // pasted into your own terminal. The two files are written out in full rather
+  // than copied from the plugin's directory, so nothing root installs is read
+  // from a place your own account can change.
+  readonly property string setupCommands: [
+    "sudo pacman -S --needed v4l2loopback-dkms v4l2loopback-utils",
+    "sudo tee /etc/systemd/system/unifi-protect-webcam.service >/dev/null <<'EOF'",
+    "[Unit]",
+    "Description=Virtual camera for the UniFi Protect Webcam plugin",
+    "After=systemd-modules-load.service",
+    "",
+    "[Service]",
+    "Type=oneshot",
+    "RemainAfterExit=yes",
+    "ExecStartPre=/bin/sh -c 'if /usr/bin/modprobe -c | /usr/bin/grep -q \"^options v4l2loopback \"; then exec /usr/bin/modprobe v4l2loopback; else exec /usr/bin/modprobe v4l2loopback devices=0; fi'",
+    "ExecStart=/usr/bin/v4l2loopback-ctl add --name \"UniFi Protect\" --exclusive-caps 1 /dev/video42",
+    "ExecStop=/usr/bin/v4l2loopback-ctl delete /dev/video42",
+    "",
+    "[Install]",
+    "WantedBy=multi-user.target",
+    "EOF",
+    "echo 'SUBSYSTEM==\"video4linux\", KERNEL==\"video42\", TAG+=\"uaccess\"' | sudo tee /etc/udev/rules.d/70-unifi-protect-webcam.rules >/dev/null",
+    "sudo udevadm control --reload-rules",
+    "sudo systemctl daemon-reload",
+    "sudo systemctl enable --now unifi-protect-webcam.service"
+  ].join("\n")
 
   // --- actions ----------------------------------------------------------------
 
@@ -590,7 +604,7 @@ Panel {
                 Layout.fillWidth: true
                 textFormat: Text.PlainText
                 wrapMode: Text.Wrap
-                text: "Run these once in a terminal. They need sudo, which is why the plugin does not run them for you."
+                text: "Run these once in a terminal. They need sudo, which is why the plugin does not run them for you. The README says what each line does."
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 color: root.muted

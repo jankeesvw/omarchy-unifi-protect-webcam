@@ -2,7 +2,7 @@
 
 An [Omarchy](https://omarchy.org) bar widget that turns a [UniFi Protect](https://ui.com/protect) camera into a webcam. Switch a camera on in the panel and Meet, Zoom, Slack and every other app see it as an ordinary camera called **UniFi Protect**.
 
-![A UniFi Protect camera in a Google Meet call, chosen as the webcam](preview.jpg)
+![A UniFi Protect camera in a Google Meet call, chosen as the webcam](preview.png)
 
 Meet mirrors your own preview, which is why the camera's timestamp reads backwards above; everybody else in the call sees it the right way round.
 
@@ -22,15 +22,32 @@ The webcam is a [v4l2loopback](https://github.com/umlaeute/v4l2loopback) device 
 
 ```bash
 sudo pacman -S --needed v4l2loopback-dkms v4l2loopback-utils
-cd ~/.config/omarchy/plugins/jankeesvw.unifi-protect-webcam
-sudo install -m 644 system/unifi-protect-webcam.service /etc/systemd/system/
-sudo install -m 644 system/70-unifi-protect-webcam.rules /etc/udev/rules.d/
+sudo tee /etc/systemd/system/unifi-protect-webcam.service >/dev/null <<'EOF'
+[Unit]
+Description=Virtual camera for the UniFi Protect Webcam plugin
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sh -c 'if /usr/bin/modprobe -c | /usr/bin/grep -q "^options v4l2loopback "; then exec /usr/bin/modprobe v4l2loopback; else exec /usr/bin/modprobe v4l2loopback devices=0; fi'
+ExecStart=/usr/bin/v4l2loopback-ctl add --name "UniFi Protect" --exclusive-caps 1 /dev/video42
+ExecStop=/usr/bin/v4l2loopback-ctl delete /dev/video42
+
+[Install]
+WantedBy=multi-user.target
+EOF
+echo 'SUBSYSTEM=="video4linux", KERNEL=="video42", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/70-unifi-protect-webcam.rules >/dev/null
 sudo udevadm control --reload-rules
 sudo systemctl daemon-reload
 sudo systemctl enable --now unifi-protect-webcam.service
 ```
 
-Read the two files in `system/` before you copy them; they are short. The service adds one device named "UniFi Protect" next to whatever v4l2loopback devices you already have, and removes it again when stopped. The udev rule tags that one device `uaccess`, which hands it to whoever is logged in at the screen. No group membership, and no permissions opened to other accounts.
+Both files are written out in full here rather than copied from the plugin's directory, so nothing root installs comes from a place your own account can change.
+
+The first line installs the module and the tool that adds devices to it. The service adds one device named "UniFi Protect" next to whatever v4l2loopback devices you already have, and removes it again when stopped. If nothing on your machine configures v4l2loopback, it loads the module with `devices=0`, so you do not also get the empty "Dummy video device" the module makes by default; if something does, those options are left alone. `exclusive-caps` is what makes Chrome offer the device as a camera at all.
+
+The udev rule tags that one device `uaccess`, which hands it to whoever is logged in at the screen. No group membership, and no permissions opened to other accounts.
 
 ### 2. An API key
 

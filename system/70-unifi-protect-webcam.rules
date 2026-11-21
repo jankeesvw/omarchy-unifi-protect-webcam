@@ -1,5 +1,0 @@
-# The virtual camera made by unifi-protect-webcam.service. uaccess hands it to
-# whoever is logged in at the screen, and to nobody else, so it takes neither a
-# group membership nor a mode that opens it to every account on the machine.
-# Numbered below 73, where systemd turns the tag into an ACL.
-SUBSYSTEM=="video4linux", KERNEL=="video42", TAG+="uaccess"
