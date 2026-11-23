@@ -24,7 +24,6 @@ Panel {
   moduleName: "jankeesvw.unifi-protect-webcam"
   ipcTarget: "jankeesvw.unifi-protect-webcam"
 
-  readonly property string iconCamera: ""
   readonly property string iconGear: ""
   readonly property string iconRefresh: ""
   readonly property string iconBack: ""
@@ -306,18 +305,13 @@ Panel {
       else root.toggle()
     }
     iconComponent: Component {
-      Text {
-        textFormat: Text.PlainText
-        text: root.iconCamera
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.icon
+      UniFiCameraMark {
+        iconSize: Style.font.icon
         // Lit while a call can see the camera; the one place that says so
         // without opening anything.
         color: root.streaming ? Commons.Color.accent
              : (root.live && root.feed.error ? Commons.Color.urgent : root.foreground)
         opacity: root.live ? 1.0 : 0.55
-        horizontalAlignment: Text.AlignHCenter
-        verticalAlignment: Text.AlignVCenter
       }
     }
   }
@@ -514,11 +508,8 @@ Panel {
           Layout.fillWidth: true
           spacing: Style.space(8)
 
-          Text {
-            textFormat: Text.PlainText
-            text: root.iconCamera
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.icon
+          UniFiCameraMark {
+            iconSize: Style.font.icon
             color: root.streaming ? Commons.Color.accent : root.foreground
           }
           Text {
