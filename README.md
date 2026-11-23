@@ -82,7 +82,7 @@ bin/unifi-protect-webcam status
 
 Protect hands out an RTSPS address for the camera. ffmpeg opens it, verified against the pinned certificate, decodes it, and scales and crops it to 1920x1080 (or 1280x720). The frames come back to `bin/unifi-protect-webcam` on a pipe, and that writes them into `/dev/video42`.
 
-The helper holds the device, not ffmpeg, and that is on purpose. A v4l2loopback device only counts as a camera while something has it open for writing, and a browser that looks while nothing does reports no camera at all. ffmpeg comes and goes; the helper stays, and keeps writing the last picture whenever there is no new one.
+The helper holds the device, not ffmpeg, and that is on purpose. A v4l2loopback device only counts as a camera while something has it open for writing, and a browser that looks while nothing does reports no camera at all. ffmpeg comes and goes; the helper stays, and keeps writing the last picture whenever there is no new one. That is the same camera's last picture: when you switch to another camera, the webcam is black until the new one comes in, never a frozen frame of the camera you switched away from.
 
 The feed runs as its own process, so restarting the shell does not take a call's camera with it. It stops when you switch it off.
 
@@ -97,7 +97,9 @@ There is no sound: the camera's microphone is not passed through, and your own m
 
 It talks to the console you configured and nothing else: the integration API on port 443 and the camera's RTSPS stream on 7441.
 
-While a camera is switched on, its stream address is on ffmpeg's command line, and other accounts on this computer can read a process's command line. The address gives access to that one camera's video. On a single-user machine that is you; on a shared one, keep it in mind.
+The stream address works as a key to that camera's video, so it never appears on a command line, which every account on the computer can read. ffmpeg gets it, together with the pinned certificate, on pipes.
+
+On a computer more than one person logs in to: the webcam belongs to whoever is at the screen. If somebody else takes the screen while a camera is on, the feed stops there and then and leaves the webcam black, so they never see your cameras; switch it on again when you are back.
 
 ## Removing
 
