@@ -865,21 +865,70 @@ class Feed:
                 process.stdout.close()
         self.retired = still
 
+    def denied(self):
+        """Why this account may not show a picture right now, or None."""
+        try:
+            if not seat_is_ours():
+                return "another account is at the screen now"
+            if not os.access(DEVICE, os.W_OK):
+                return f"this account can no longer use {DEVICE}"
+        except OSError:
+            return "cannot tell who is at the screen"
+        return None
+
+    def may_show(self):
+        """Whether a picture may go out now. Only ever called with write_lock held.
+
+        Every write of a camera's picture asks this first, inside the same lock
+        as the write itself, so the seat is checked against the very write it
+        allows and nothing can slip in between. The answer is no once the feed
+        is stopping, and no for good the first time this account may no longer
+        show a picture: the device is then blacked out before the lock is let
+        go, and the feed is on its way out.
+        """
+        if self.stopping:
+            return False
+        why = self.denied()
+        if why is None:
+            return True
+        self.fatal = why
+        self.stopping = True
+        if self.loopback is not None:
+            try:
+                self.last = self.loopback.black()
+                for _ in range(8):
+                    self.loopback.write(self.last)
+            except OSError:
+                pass
+        return False
+
     def hold(self):
-        """Write the last picture again whenever nothing new has come in.
+        """Keep the last picture going, for as long as this account may show it.
 
         A thread of its own, so nothing the loop waits on (the console, an
-        ffmpeg that is slow to start) can leave the device without frames.
+        ffmpeg that is slow to start) can leave the device without frames. For
+        the same reason it does not rely on the loop to notice a seat change:
+        the loop can be stuck in a request to the console for seconds while
+        this goes on writing. It asks may_show() every 50 ms, whether a write
+        is due or not, so a seat change blacks out the device within that time
+        however busy the loop is.
         """
-        while not self.stopping:
-            time.sleep(0.05)
-            with self.write_lock:
-                if self.loopback is not None and time.monotonic() - self.last_write >= HOLD_EVERY:
-                    try:
-                        self.loopback.write(self.last)
-                    except OSError:
-                        pass
-                    self.last_write = time.monotonic()
+        try:
+            while not self.stopping:
+                time.sleep(0.05)
+                with self.write_lock:
+                    if not self.may_show():
+                        return
+                    if self.loopback is not None and time.monotonic() - self.last_write >= HOLD_EVERY:
+                        try:
+                            self.loopback.write(self.last)
+                        except OSError:
+                            pass
+                        self.last_write = time.monotonic()
+        finally:
+            # Nothing checks the seat once this thread is gone, so nothing may
+            # go on showing a picture either.
+            self.stopping = True
 
     # -- the loop ----------------------------------------------------------
 
@@ -948,22 +997,8 @@ class Feed:
         started = 0.0
         frames, window = 0, time.monotonic()
         published = 0.0
-        checked = 0.0
         while not self.stopping:
             now = time.monotonic()
-
-            # Whoever is at the screen gets the device. Somebody else taking the
-            # seat, or this account losing the device for any other reason,
-            # ends the feed there and then, rather than going on showing the
-            # cameras of the account that left.
-            if now - checked >= 0.25:
-                checked = now
-                if not seat_is_ours():
-                    self.fatal = "another account is at the screen now"
-                    return
-                if not os.access(DEVICE, os.W_OK):
-                    self.fatal = f"this account can no longer use {DEVICE}"
-                    return
 
             if self.reload:
                 self.reload = False
@@ -1004,6 +1039,11 @@ class Feed:
                         filled += got
                         if filled == len(self.frame):
                             with self.write_lock:
+                                # Per frame and under the lock, so no picture
+                                # goes out after a seat change, and none after
+                                # the holder has blacked out the device.
+                                if not self.may_show():
+                                    return
                                 self.loopback.write(self.frame)
                                 self.frame, self.last = self.last, self.frame
                                 self.last_write = time.monotonic()

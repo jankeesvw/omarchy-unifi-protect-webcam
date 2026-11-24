@@ -99,7 +99,7 @@ It talks to the console you configured and nothing else: the integration API on 
 
 The stream address works as a key to that camera's video, so it never appears on a command line, which every account on the computer can read. ffmpeg gets it, together with the pinned certificate, on pipes.
 
-On a computer more than one person logs in to: the webcam belongs to whoever is at the screen. If somebody else takes the screen while a camera is on, the feed stops there and then and leaves the webcam black, so they never see your cameras; switch it on again when you are back.
+On a computer more than one person logs in to: the webcam belongs to whoever is at the screen. If somebody else takes the screen while a camera is on, the feed stops there and then and leaves the webcam black, so they never see your cameras; switch it on again when you are back. That holds while it is reconnecting too: the seat is checked right before every picture goes out, not only when the feed gets round to it. `python3 -I tests/test_seat_change.py` checks this without a camera or a device.
 
 ## Removing
 
